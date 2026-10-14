@@ -1,55 +1,27 @@
-﻿
-using System.Security.Claims;
-using ECommerceAPI.Data;
+﻿using ECommerceAPI.Data;
 using ECommerceAPI.Data.Entities;
 using ECommerceAPI.DTOs;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using System.Security.Claims;
 
 namespace ECommerceAPI.Controllers
 {
     [Route("api/[controller]")]
     [ApiController]
-    [Authorize]
-    public class OrdersController : ControllerBase
+    public class OrdersController(ECommerceDbContext context) : ControllerBase
     {
-        private readonly ECommerceDbContext _context;
-
-        public OrdersController(ECommerceDbContext context)
+        private int? GetCurrentUserId()
         {
-            _context = context;
+            var claim = User.FindFirst("UserId")?.Value
+                ?? User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+
+            return int.TryParse(claim, out int userId) ? userId : null;
         }
 
-        private int GetUserId()
+        private static OrderResponseDto MapOrder(Order order)
         {
-            var userId = User.FindFirstValue(ClaimTypes.NameIdentifier)
-                         ?? User.FindFirstValue("sub");
-
-            return int.TryParse(userId, out var id) ? id : 0;
-        }
-
-        private async Task<OrderResponseDto> MapOrder(Order order)
-        {
-            var items = new List<OrderItemResponseDto>();
-
-            foreach (var item in order.OrderItems)
-            {
-                var productName = await _context.Products
-                    .Where(p => p.Id == item.ProductId)
-                    .Select(p => p.Name)
-                    .FirstOrDefaultAsync();
-
-                items.Add(new OrderItemResponseDto
-                {
-                    Id = item.Id,
-                    ProductId = item.ProductId,
-                    ProductName = productName ?? "Unknown Product",
-                    Quantity = item.Quantity,
-                    UnitPrice = item.UnitPrice
-                });
-            }
-
             return new OrderResponseDto
             {
                 Id = order.Id,
@@ -58,7 +30,20 @@ namespace ECommerceAPI.Controllers
                 TotalAmount = order.TotalAmount,
                 Status = order.Status,
                 OrderDate = order.OrderDate,
-                OrderItems = items,
+
+                OrderItems = order.OrderItems.Select(i =>
+                    new OrderItemResponseDto
+                    {
+                        Id = i.Id,
+                        ProductId = i.ProductId,
+                        ProductName = i.Product.Name,
+                        ProductVariantId = i.ProductVariantId,
+                        Size = i.ProductVariant?.Size,
+                        Color = i.ProductVariant?.Color,
+                        Quantity = i.Quantity,
+                        UnitPrice = i.UnitPrice
+                    }).ToList(),
+
                 Payment = order.Payment == null ? null : new PaymentResponseDto
                 {
                     Id = order.Payment.Id,
@@ -73,101 +58,142 @@ namespace ECommerceAPI.Controllers
 
         [HttpPost("checkout")]
         [Authorize(Roles = "Customer")]
-        public async Task<IActionResult> Checkout(CreateOrderDto dto)
+        public async Task<IActionResult> Checkout()
         {
-            var userId = GetUserId();
+            var userId = GetCurrentUserId();
 
-            if (userId <= 0)
-                return Unauthorized();
+            if (userId == null)
+                return Unauthorized(new { message = "Invalid user token." });
 
-            if (dto.PaymentMethod != "CashOnDelivery")
-                return BadRequest("Only CashOnDelivery is supported currently.");
+            var address = await context.Addresses
+                .FirstOrDefaultAsync(a =>
+                    a.UserId == userId.Value && a.IsDefault)
+                ?? await context.Addresses
+                    .FirstOrDefaultAsync(a => a.UserId == userId.Value);
+
+            if (address == null)
+                return BadRequest(new
+                {
+                    message = "Please add a shipping address before checkout."
+                });
+
+            var cart = await context.Carts
+                .Include(c => c.CartItems)
+                    .ThenInclude(ci => ci.Product)
+                .Include(c => c.CartItems)
+                    .ThenInclude(ci => ci.ProductVariant)
+                .FirstOrDefaultAsync(c => c.UserId == userId.Value);
+
+            if (cart == null || !cart.CartItems.Any())
+                return BadRequest(new { message = "Your cart is empty." });
 
             await using var transaction =
-                await _context.Database.BeginTransactionAsync();
+                await context.Database.BeginTransactionAsync();
 
             try
             {
-                var address = await _context.Addresses
-                    .FirstOrDefaultAsync(a =>
-                        a.Id == dto.ShippingAddressId &&
-                        a.UserId == userId);
+                var order = new Order
+                {
+                    UserId = userId.Value,
+                    ShippingAddressId = address.Id,
+                    Status = "Pending",
+                    TotalAmount = 0,
+                    OrderDate = DateTime.UtcNow
+                };
 
-                if (address == null)
-                    return BadRequest("Invalid shipping address.");
+                context.Orders.Add(order);
+                await context.SaveChangesAsync();
 
-                var cart = await _context.Carts
-                    .Include(c => c.CartItems)
-                    .FirstOrDefaultAsync(c => c.UserId == userId);
-
-                if (cart == null || !cart.CartItems.Any())
-                    return BadRequest("Your cart is empty.");
-
-                var orderItems = new List<OrderItem>();
                 decimal totalAmount = 0;
 
                 foreach (var item in cart.CartItems)
                 {
-                    var product = await _context.Products
-                        .FirstOrDefaultAsync(p => p.Id == item.ProductId);
-
-                    if (product == null)
-                        return BadRequest(
-                            $"Product {item.ProductId} was not found.");
-
-                    var stock = await _context.Stocks
-                        .FirstOrDefaultAsync(s => s.ProductId == item.ProductId);
-
-                    if (stock == null ||
-                        stock.Quantity - stock.ReservedQuantity < item.Quantity)
+                    if (item.Quantity <= 0)
                     {
-                        return BadRequest(
-                            $"Insufficient stock for product {product.Name}.");
+                        await transaction.RollbackAsync();
+                        return BadRequest(new
+                        {
+                            message = "Quantity must be greater than zero."
+                        });
                     }
 
-                    stock.Quantity -= item.Quantity;
-                    stock.UpdatedAt = DateTime.UtcNow;
-
-                    totalAmount += product.Price * item.Quantity;
-
-                    orderItems.Add(new OrderItem
+                    if (item.ProductVariantId == null)
                     {
-                        ProductId = product.Id,
+                        await transaction.RollbackAsync();
+                        return BadRequest(new
+                        {
+                            message = $"Select a product variant for product {item.ProductId}."
+                        });
+                    }
+
+                    var variant = await context.ProductVariants
+                        .FirstOrDefaultAsync(v =>
+                            v.Id == item.ProductVariantId.Value &&
+                            v.ProductId == item.ProductId);
+
+                    if (variant == null)
+                    {
+                        await transaction.RollbackAsync();
+                        return BadRequest(new
+                        {
+                            message = $"Variant not found for product {item.ProductId}."
+                        });
+                    }
+
+                    var affectedRows = await context.ProductVariants
+                        .Where(v =>
+                            v.Id == variant.Id &&
+                            v.StockQuantity >= item.Quantity)
+                        .ExecuteUpdateAsync(setters => setters
+                            .SetProperty(
+                                v => v.StockQuantity,
+                                v => v.StockQuantity - item.Quantity));
+
+                    if (affectedRows == 0)
+                    {
+                        await transaction.RollbackAsync();
+                        return BadRequest(new
+                        {
+                            message = $"Insufficient stock for variant {variant.Id}."
+                        });
+                    }
+
+                    decimal unitPrice =
+                        item.Product.Price + variant.AdditionalPrice;
+
+                    totalAmount += unitPrice * item.Quantity;
+
+                    context.OrderItems.Add(new OrderItem
+                    {
+                        OrderId = order.Id,
+                        ProductId = item.ProductId,
+                        ProductVariantId = variant.Id,
                         Quantity = item.Quantity,
-                        UnitPrice = product.Price
+                        UnitPrice = unitPrice
                     });
                 }
 
-                var order = new Order
+                order.TotalAmount = totalAmount;
+
+                context.OrderStatusHistories.Add(new OrderStatusHistory
                 {
-                    UserId = userId,
-                    ShippingAddressId = dto.ShippingAddressId,
-                    TotalAmount = totalAmount,
+                    OrderId = order.Id,
                     Status = "Pending",
-                    OrderDate = DateTime.UtcNow,
-                    OrderItems = orderItems,
-                    Payment = new Payment
-                    {
-                        Amount = totalAmount,
-                        PaymentMethod = "CashOnDelivery",
-                        Status = "Pending",
-                        PaymentDate = DateTime.UtcNow
-                    }
-                };
+                    ChangedAt = DateTime.UtcNow,
+                    Note = "Order placed."
+                });
 
-                _context.Orders.Add(order);
-                _context.CartItems.RemoveRange(cart.CartItems);
+                context.CartItems.RemoveRange(cart.CartItems);
 
-                await _context.SaveChangesAsync();
+                await context.SaveChangesAsync();
                 await transaction.CommitAsync();
 
                 return Ok(new
                 {
-                    message = "Order placed successfully.",
+                    message = "Checkout successful.",
                     orderId = order.Id,
                     totalAmount = order.TotalAmount,
-                    status = order.Status,
-                    paymentMethod = "CashOnDelivery"
+                    status = order.Status
                 });
             }
             catch
@@ -181,44 +207,51 @@ namespace ECommerceAPI.Controllers
         [Authorize(Roles = "Customer")]
         public async Task<IActionResult> GetMyOrders()
         {
-            var userId = GetUserId();
+            var userId = GetCurrentUserId();
 
-            if (userId <= 0)
+            if (userId == null)
                 return Unauthorized();
 
-            var orders = await _context.Orders
-                .Where(o => o.UserId == userId)
+            var orders = await context.Orders
+                .Where(o => o.UserId == userId.Value)
                 .Include(o => o.OrderItems)
+                    .ThenInclude(i => i.Product)
+                .Include(o => o.OrderItems)
+                    .ThenInclude(i => i.ProductVariant)
                 .Include(o => o.Payment)
                 .OrderByDescending(o => o.OrderDate)
                 .ToListAsync();
 
-            var result = new List<OrderResponseDto>();
-
-            foreach (var order in orders)
-                result.Add(await MapOrder(order));
-
-            return Ok(result);
+            return Ok(orders.Select(MapOrder).ToList());
         }
 
         [HttpGet("{id:int}")]
         [Authorize(Roles = "Customer,Admin")]
         public async Task<IActionResult> GetOrder(int id)
         {
-            var userId = GetUserId();
-
-            var order = await _context.Orders
+            var order = await context.Orders
                 .Include(o => o.OrderItems)
+                    .ThenInclude(i => i.Product)
+                .Include(o => o.OrderItems)
+                    .ThenInclude(i => i.ProductVariant)
                 .Include(o => o.Payment)
                 .FirstOrDefaultAsync(o => o.Id == id);
 
             if (order == null)
-                return NotFound("Order not found.");
+                return NotFound(new { message = "Order not found." });
 
-            if (!User.IsInRole("Admin") && order.UserId != userId)
-                return Forbid();
+            if (User.IsInRole("Customer"))
+            {
+                var userId = GetCurrentUserId();
 
-            return Ok(await MapOrder(order));
+                if (userId == null)
+                    return Unauthorized();
+
+                if (order.UserId != userId.Value)
+                    return Forbid();
+            }
+
+            return Ok(MapOrder(order));
         }
 
         [HttpPut("{id:int}/status")]
@@ -226,36 +259,194 @@ namespace ECommerceAPI.Controllers
         public async Task<IActionResult> UpdateStatus(
             int id, [FromBody] string status)
         {
-            var allowedStatuses = new[]
-            {
-                "Pending", "Confirmed", "Processing",
-                "Shipped", "Delivered", "Cancelled"
-            };
+            if (string.IsNullOrWhiteSpace(status))
+                return BadRequest(new { message = "Status is required." });
 
-            if (string.IsNullOrWhiteSpace(status) ||
-                !allowedStatuses.Contains(status,
-                    StringComparer.OrdinalIgnoreCase))
-            {
-                return BadRequest("Invalid order status.");
-            }
+            status = status.Trim();
 
-            var order = await _context.Orders
+            var order = await context.Orders
                 .FirstOrDefaultAsync(o => o.Id == id);
 
             if (order == null)
-                return NotFound("Order not found.");
+                return NotFound(new { message = "Order not found." });
 
-            order.Status = allowedStatuses.First(
-                s => s.Equals(status, StringComparison.OrdinalIgnoreCase));
+            var allowedTransitions =
+                new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["Pending"] = new[] { "Confirmed", "Cancelled" },
+                    ["Confirmed"] = new[] { "Processing", "Cancelled" },
+                    ["Processing"] = new[] { "Shipped", "Cancelled" },
+                    ["Shipped"] = new[] { "Delivered" },
+                    ["Delivered"] = Array.Empty<string>(),
+                    ["Cancelled"] = Array.Empty<string>()
+                };
 
-            await _context.SaveChangesAsync();
+            if (!allowedTransitions.TryGetValue(
+                    order.Status, out var nextStatuses))
+            {
+                return BadRequest(new
+                {
+                    message = $"Unknown current order status: {order.Status}."
+                });
+            }
+
+            if (!nextStatuses.Contains(
+                    status, StringComparer.OrdinalIgnoreCase))
+            {
+                return BadRequest(new
+                {
+                    message =
+                        $"Cannot change order status from {order.Status} to {status}.",
+                    currentStatus = order.Status,
+                    allowedNextStatuses = nextStatuses
+                });
+            }
+
+            status = nextStatuses.First(s =>
+                s.Equals(status, StringComparison.OrdinalIgnoreCase));
+
+            var previousStatus = order.Status;
+            order.Status = status;
+
+            context.OrderStatusHistories.Add(new OrderStatusHistory
+            {
+                OrderId = order.Id,
+                Status = status,
+                ChangedAt = DateTime.UtcNow,
+                Note = $"Status changed from {previousStatus} to {status}."
+            });
+
+            await context.SaveChangesAsync();
 
             return Ok(new
             {
-                message = "Order status updated.",
-                orderId = order.Id,
-                status = order.Status
+                message = "Order status updated and history saved.",
+                orderId = id,
+                previousStatus,
+                status
             });
+        }
+
+        [HttpGet("{id:int}/status-history")]
+        [Authorize(Roles = "Admin")]
+        public async Task<IActionResult> GetStatusHistory(int id)
+        {
+            var orderExists = await context.Orders
+                .AnyAsync(o => o.Id == id);
+
+            if (!orderExists)
+                return NotFound(new { message = "Order not found." });
+
+            var history = await context.OrderStatusHistories
+                .Where(h => h.OrderId == id)
+                .OrderBy(h => h.ChangedAt)
+                .Select(h => new
+                {
+                    h.Id,
+                    h.OrderId,
+                    h.Status,
+                    h.ChangedAt,
+                    h.Note
+                })
+                .ToListAsync();
+
+            return Ok(history);
+        }
+
+        [HttpPut("{id:int}/cancel")]
+        [Authorize(Roles = "Customer")]
+        public async Task<IActionResult> CancelOrder(int id)
+        {
+            var userId = GetCurrentUserId();
+
+            if (userId == null)
+                return Unauthorized(new { message = "Invalid user token." });
+
+            await using var transaction =
+                await context.Database.BeginTransactionAsync();
+
+            try
+            {
+                var order = await context.Orders
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(o =>
+                        o.Id == id && o.UserId == userId.Value);
+
+                if (order == null)
+                {
+                    await transaction.RollbackAsync();
+                    return NotFound(new { message = "Order not found." });
+                }
+
+                if (order.Status != "Pending" &&
+                    order.Status != "Confirmed")
+                {
+                    await transaction.RollbackAsync();
+                    return BadRequest(new
+                    {
+                        message = $"Order cannot be cancelled when status is {order.Status}."
+                    });
+                }
+
+                var updated = await context.Orders
+                    .Where(o =>
+                        o.Id == id &&
+                        o.UserId == userId.Value &&
+                        (o.Status == "Pending" || o.Status == "Confirmed"))
+                    .ExecuteUpdateAsync(setters => setters
+                        .SetProperty(o => o.Status, "Cancelled"));
+
+                if (updated == 0)
+                {
+                    await transaction.RollbackAsync();
+                    return Conflict(new
+                    {
+                        message = "Order status changed. Please refresh and try again."
+                    });
+                }
+
+                var items = await context.OrderItems
+                    .AsNoTracking()
+                    .Where(i => i.OrderId == id)
+                    .ToListAsync();
+
+                foreach (var item in items)
+                {
+                    if (item.ProductVariantId.HasValue)
+                    {
+                        await context.ProductVariants
+                            .Where(v => v.Id == item.ProductVariantId.Value)
+                            .ExecuteUpdateAsync(setters => setters
+                                .SetProperty(
+                                    v => v.StockQuantity,
+                                    v => v.StockQuantity + item.Quantity));
+                    }
+                }
+
+                context.OrderStatusHistories.Add(new OrderStatusHistory
+                {
+                    OrderId = id,
+                    Status = "Cancelled",
+                    ChangedAt = DateTime.UtcNow,
+                    Note = $"Order cancelled by customer. Previous status: {order.Status}. Stock restored."
+                });
+
+                await context.SaveChangesAsync();
+                await transaction.CommitAsync();
+
+                return Ok(new
+                {
+                    message = "Order cancelled and stock restored successfully.",
+                    orderId = id,
+                    previousStatus = order.Status,
+                    status = "Cancelled"
+                });
+            }
+            catch
+            {
+                await transaction.RollbackAsync();
+                throw;
+            }
         }
     }
 }

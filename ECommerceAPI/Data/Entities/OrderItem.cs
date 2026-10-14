@@ -1,4 +1,5 @@
-﻿namespace ECommerceAPI.Data.Entities
+﻿
+namespace ECommerceAPI.Data.Entities
 {
     public class OrderItem
     {
@@ -8,6 +9,8 @@
 
         public int ProductId { get; set; }
 
+        public int? ProductVariantId { get; set; }
+
         public int Quantity { get; set; }
 
         public decimal UnitPrice { get; set; }
@@ -15,5 +18,7 @@
         public Order Order { get; set; } = null!;
 
         public Product Product { get; set; } = null!;
+
+        public ProductVariant? ProductVariant { get; set; }
     }
 }

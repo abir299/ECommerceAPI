@@ -1,4 +1,5 @@
-﻿namespace ECommerceAPI.Data.Entities
+﻿
+namespace ECommerceAPI.Data.Entities
 {
     public class Address
     {
